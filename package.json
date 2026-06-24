@@ -1,0 +1,23 @@
+{
+  "name": "tunecamp-peer",
+  "version": "1.0.0",
+  "description": "Standalone CLI peer sharing client daemon for TuneCamp",
+  "main": "peer-daemon.js",
+  "type": "module",
+  "scripts": {
+    "start": "node peer-daemon.js",
+    "scan": "node peer-daemon.js --scan-only"
+  },
+  "keywords": [
+    "tunecamp",
+    "peer-to-peer",
+    "audio-sharing",
+    "cli"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "music-metadata": "^11.12.3",
+    "ws": "^8.21.0"
+  }
+}
