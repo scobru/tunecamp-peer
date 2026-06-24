@@ -89,14 +89,62 @@ export function initTui(tuiBridge, options) {
         }
     });
 
+    // Network Explorer Panel (Container, occupies same space as statusBox/streamsBox)
+    const networkBox = blessed.box({
+        parent: screen,
+        top: 3,
+        left: 0,
+        width: "100%",
+        height: "50%-3",
+        hidden: true
+    });
+
+    const peersList = blessed.list({
+        parent: networkBox,
+        top: 0,
+        left: 0,
+        width: "40%",
+        height: "100%",
+        label: " Active Peers ",
+        border: { type: "line" },
+        keys: true,
+        mouse: true,
+        scrollbar: { ch: " ", inverse: true },
+        style: {
+            border: { fg: "cyan" },
+            label: { bold: true, fg: "cyan" },
+            selected: { bg: "cyan", fg: "black", bold: true },
+            item: { fg: "white" }
+        }
+    });
+
+    const tracksList = blessed.list({
+        parent: networkBox,
+        top: 0,
+        left: "40%",
+        width: "60%",
+        height: "100%",
+        label: " Shared Tracks ",
+        border: { type: "line" },
+        keys: true,
+        mouse: true,
+        scrollbar: { ch: " ", inverse: true },
+        style: {
+            border: { fg: "green" },
+            label: { bold: true, fg: "green" },
+            selected: { bg: "green", fg: "black", bold: true },
+            item: { fg: "white" }
+        }
+    });
+
     // Footer Bar (Help)
-    blessed.box({
+    const footerBar = blessed.box({
         parent: screen,
         top: "100%-1",
         left: 0,
         width: "100%",
         height: 1,
-        content: " [Q] Quit | [R] Force Rescan & Reconnect | [D] Toggle Downloads ",
+        content: " [Q] Quit | [R] Force Rescan | [D] Toggle Downloads | [N] Network Explorer ",
         style: {
             bg: "white",
             fg: "black"
@@ -128,6 +176,10 @@ export function initTui(tuiBridge, options) {
     let tracksCount = 0;
     let allowDownloads = options.allowDownloads;
     const currentStreams = new Map();
+
+    let currentMode = "sharing"; // "sharing" or "network"
+    let activePeers = [];
+    let activeTracks = [];
 
     function formatState(state) {
         if (state === "Online") return "{green-fg}{bold}Online (Connected){/bold}{/green-fg}";
@@ -172,6 +224,92 @@ export function initTui(tuiBridge, options) {
         }
         streamsBox.setContent(lines.join("\n"));
         screen.render();
+    }
+
+    function updateFooter() {
+        if (currentMode === "sharing") {
+            footerBar.setContent(" [Q] Quit | [R] Force Rescan | [D] Toggle Downloads | [N] Network Explorer ");
+        } else {
+            const focusName = screen.focused === peersList ? "PEERS" : "TRACKS";
+            footerBar.setContent(` [Q] Quit | [N] Back to Sharing | [Tab] Switch Focus (Active: ${focusName}) | [Enter/D] Download Track `);
+        }
+        screen.render();
+    }
+
+    function loadTracksForPeer(peer) {
+        if (!peer) {
+            tracksList.setItems([]);
+            activeTracks = [];
+            screen.render();
+            return;
+        }
+        tracksList.setItems(["Loading tracks..."]);
+        activeTracks = [];
+        screen.render();
+
+        tuiBridge.emit("cmd:get_peer_tracks", peer.id, (err, tracks) => {
+            if (currentMode !== "network" || activePeers[peersList.selected]?.id !== peer.id) return;
+            if (err) {
+                tracksList.setItems([`Error: ${err.message}`]);
+                screen.render();
+                return;
+            }
+            activeTracks = tracks || [];
+            const items = activeTracks.map(t => `${t.artist || "Unknown"} - ${t.title}`);
+            if (items.length === 0) {
+                tracksList.setItems(["No tracks shared."]);
+            } else {
+                tracksList.setItems(items);
+            }
+            screen.render();
+        });
+    }
+
+    function refreshNetworkPeers() {
+        peersList.setItems(["Loading peers..."]);
+        tracksList.setItems([]);
+        activePeers = [];
+        activeTracks = [];
+        screen.render();
+
+        tuiBridge.emit("cmd:get_network_peers", (err, peers) => {
+            if (currentMode !== "network") return;
+            if (err) {
+                peersList.setItems([`Error: ${err.message}`]);
+                screen.render();
+                return;
+            }
+            activePeers = peers || [];
+            const items = activePeers.map(p => `${p.username} (${p.trackCount || 0} tracks)`);
+            if (items.length === 0) {
+                peersList.setItems(["No peers online."]);
+            } else {
+                peersList.setItems(items);
+                peersList.select(0);
+                loadTracksForPeer(activePeers[0]);
+            }
+            screen.render();
+        });
+    }
+
+    function downloadSelectedTrack() {
+        const track = activeTracks[tracksList.selected];
+        const peer = activePeers[peersList.selected];
+        if (track && peer && track.id) {
+            console.log(`📥 Requesting download: "${track.title}" from peer "${peer.username}"...`);
+            tuiBridge.emit("cmd:download_track", {
+                sessionId: peer.id,
+                trackId: track.id,
+                title: track.title,
+                artist: track.artist
+            }, (err, filename) => {
+                if (err) {
+                    console.error(`❌ Download failed for "${track.title}": ${err.message}`);
+                } else {
+                    console.log(`✓ Download complete! Saved: downloads/${filename}`);
+                }
+            });
+        }
     }
 
     // Bridge listeners
@@ -229,16 +367,28 @@ export function initTui(tuiBridge, options) {
     });
 
     tuiBridge.on("stream:end", (requestId) => {
+        const stream = currentStreams.get(requestId);
+        if (stream) {
+            console.log(`⏹ Finished streaming: ${stream.title}`);
+        }
         currentStreams.delete(requestId);
         updateStreams();
     });
 
     tuiBridge.on("stream:cancel", (requestId) => {
+        const stream = currentStreams.get(requestId);
+        if (stream) {
+            console.log(`⏹ Stream canceled: ${stream.title}`);
+        }
         currentStreams.delete(requestId);
         updateStreams();
     });
 
-    tuiBridge.on("stream:error", ({ requestId }) => {
+    tuiBridge.on("stream:error", ({ requestId, message }) => {
+        const stream = currentStreams.get(requestId);
+        if (stream) {
+            console.error(`❌ Stream error: ${stream.title} (${message || "unknown"})`);
+        }
         currentStreams.delete(requestId);
         updateStreams();
     });
@@ -246,6 +396,18 @@ export function initTui(tuiBridge, options) {
     tuiBridge.on("config:downloads", (val) => {
         allowDownloads = val;
         updateStatus();
+    });
+
+    // List bindings
+    peersList.on("select item", (item, index) => {
+        loadTracksForPeer(activePeers[index]);
+    });
+
+    peersList.on("focus", () => updateFooter());
+    tracksList.on("focus", () => updateFooter());
+
+    tracksList.on("select", () => {
+        downloadSelectedTrack();
     });
 
     // Keyboard controls
@@ -256,11 +418,44 @@ export function initTui(tuiBridge, options) {
     });
 
     screen.key(["r"], () => {
-        tuiBridge.emit("cmd:rescan");
+        if (currentMode === "sharing") {
+            tuiBridge.emit("cmd:rescan");
+        }
     });
 
     screen.key(["d"], () => {
-        tuiBridge.emit("cmd:toggle_downloads");
+        if (currentMode === "sharing") {
+            tuiBridge.emit("cmd:toggle_downloads");
+        } else if (currentMode === "network") {
+            downloadSelectedTrack();
+        }
+    });
+
+    screen.key(["n", "N"], () => {
+        if (currentMode === "sharing") {
+            currentMode = "network";
+            statusBox.hide();
+            streamsBox.hide();
+            networkBox.show();
+            refreshNetworkPeers();
+            peersList.focus();
+        } else {
+            currentMode = "sharing";
+            networkBox.hide();
+            statusBox.show();
+            streamsBox.show();
+        }
+        updateFooter();
+    });
+
+    screen.key(["tab"], () => {
+        if (currentMode !== "network") return;
+        if (screen.focused === peersList) {
+            tracksList.focus();
+        } else {
+            peersList.focus();
+        }
+        updateFooter();
     });
 
     // Refresh active streams elapsed times periodically

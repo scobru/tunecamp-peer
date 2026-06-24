@@ -421,6 +421,73 @@ tuiBridge.on("cmd:toggle_downloads", () => {
     connect();
 });
 
+tuiBridge.on("cmd:get_network_peers", async (callback) => {
+    try {
+        const res = await fetch(`${options.server}/api/peers`, {
+            headers: { "Authorization": `Bearer ${options.token}` }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const peers = await res.json();
+        callback(null, peers);
+    } catch (err) {
+        callback(err);
+    }
+});
+
+tuiBridge.on("cmd:get_peer_tracks", async (sessionId, callback) => {
+    try {
+        const res = await fetch(`${options.server}/api/peers/${sessionId}/tracks`, {
+            headers: { "Authorization": `Bearer ${options.token}` }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const tracks = await res.json();
+        callback(null, tracks);
+    } catch (err) {
+        callback(err);
+    }
+});
+
+tuiBridge.on("cmd:download_track", async ({ sessionId, trackId, title, artist }, callback) => {
+    try {
+        const url = `${options.server}/api/peers/${sessionId}/tracks/${trackId}/download?token=${options.token}`;
+        const response = await fetch(url);
+        if (!response.ok) {
+            let errMsg = `HTTP ${response.status}`;
+            try {
+                const data = await response.json();
+                if (data && data.error) errMsg = data.error;
+            } catch {}
+            throw new Error(errMsg);
+        }
+
+        const contentDisposition = response.headers.get("content-disposition");
+        let filename = `${artist || "Unknown Artist"} - ${title || "Track"}.mp3`;
+        if (contentDisposition) {
+            const match = contentDisposition.match(/filename="(.+?)"/);
+            if (match) {
+                filename = match[1];
+            }
+        }
+        filename = filename.replace(/[<>:"/\\|?*]/g, "_");
+
+        const destDir = path.resolve("downloads");
+        if (!fs.existsSync(destDir)) {
+            fs.mkdirSync(destDir, { recursive: true });
+        }
+        const destPath = path.join(destDir, filename);
+
+        const fileStream = fs.createWriteStream(destPath);
+        for await (const chunk of response.body) {
+            fileStream.write(chunk);
+        }
+        fileStream.end();
+        
+        callback(null, filename);
+    } catch (err) {
+        callback(err);
+    }
+});
+
 // Graceful exit
 process.on("SIGINT", () => {
     console.log("\n🛑 Stopping peer daemon...");
