@@ -5,6 +5,9 @@ import path from "path";
 import crypto from "crypto";
 import { WebSocket } from "ws";
 import * as musicMetadata from "music-metadata";
+import { EventEmitter } from "events";
+
+const tuiBridge = new EventEmitter();
 
 // Load .env file manually if it exists
 if (fs.existsSync(".env")) {
@@ -37,7 +40,8 @@ function parseArgs() {
             : [],
         allowDownloads: process.env.TUNECAMP_ALLOW_DOWNLOADS !== "false",
         help: false,
-        scanOnly: false
+        scanOnly: false,
+        tui: process.env.TUNECAMP_TUI === "true" || false
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -57,6 +61,8 @@ function parseArgs() {
             options.allowDownloads = false;
         } else if (args[i] === "--scan-only") {
             options.scanOnly = true;
+        } else if (args[i] === "--tui") {
+            options.tui = true;
         } else if (args[i] === "--help" || args[i] === "-h") {
             options.help = true;
         }
@@ -80,6 +86,7 @@ Options:
   -f, --folder, --share <paths...> Local music folder(s) to share (can be specified multiple times)
   --no-allow-downloads    Disable track downloads (only allow streaming)
   --scan-only             Scan folders and display metadata summary, then exit
+  --tui                   Run dynamic Text User Interface dashboard
   -h, --help              Show this help menu
 
 Configuration:
@@ -121,6 +128,7 @@ function walkDir(dir, files = []) {
 }
 
 async function scanFolders(folders) {
+    tuiBridge.emit("scan:start", folders);
     console.log("🔍 Scanning local folders...");
     const files = [];
     for (const f of folders) {
@@ -175,12 +183,14 @@ async function scanFolders(folders) {
             count++;
             if (count % 100 === 0 || count === files.length) {
                 console.log(`   Processed ${count}/${files.length} files...`);
+                tuiBridge.emit("scan:progress", { count, total: files.length });
             }
         } catch (err) {
             console.error(`❌ Failed to parse metadata for ${file.path}:`, err.message);
         }
     }
 
+    tuiBridge.emit("scan:complete", manifests);
     return manifests;
 }
 
@@ -200,6 +210,7 @@ if (options.scanOnly) {
 
 let reconnectDelay = 2000;
 let ws = null;
+let reconnectTimeout = null;
 
 async function connect() {
     const manifests = await scanFolders(options.folders);
@@ -210,11 +221,13 @@ async function connect() {
     const wsUrl = `${baseWsUrl}/ws/peer?token=${options.token}&allowDownloads=${options.allowDownloads}`;
 
     console.log(`🔌 Connecting to TuneCamp instance: ${options.server}`);
+    tuiBridge.emit("conn:connecting", { server: options.server });
     
     ws = new WebSocket(wsUrl);
 
     ws.on("open", () => {
         console.log("⚡ Connected! Authenticating...");
+        tuiBridge.emit("conn:open");
         reconnectDelay = 2000; // Reset reconnect delay
     });
 
@@ -227,10 +240,12 @@ async function connect() {
                     console.log(`🚀 Authentication successful! Session ID: ${message.sessionId}`);
                     console.log("📤 Sending shared tracks manifest...");
                     ws.send(JSON.stringify({ type: "manifest", tracks: manifests }));
+                    tuiBridge.emit("conn:auth_ok", { sessionId: message.sessionId, manifestsCount: manifests.length });
                     break;
 
                 case "auth_fail":
                     console.error(`❌ Authentication failed: ${message.reason}`);
+                    tuiBridge.emit("conn:auth_fail", message.reason);
                     ws.close();
                     process.exit(1);
 
@@ -258,12 +273,15 @@ async function connect() {
     ws.on("close", () => {
         console.log(`🔌 Connection closed. Reconnecting in ${reconnectDelay / 1000}s...`);
         cleanupStreams();
-        setTimeout(connect, reconnectDelay);
+        tuiBridge.emit("conn:close", { reconnectDelay });
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        reconnectTimeout = setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Exponential backoff max 60s
     });
 
     ws.on("error", (err) => {
         console.error("❌ WebSocket connection error:", err.message);
+        tuiBridge.emit("conn:error", err.message);
     });
 }
 
@@ -276,10 +294,12 @@ function handleRequest(requestId, trackId) {
             requestId,
             message: "File not found locally"
         }));
+        tuiBridge.emit("stream:error", { requestId, trackId, message: "File not found locally" });
         return;
     }
 
     console.log(`▶ Streaming [Track ID: ${trackId}] -> ${path.basename(filePath)}`);
+    tuiBridge.emit("stream:start", { requestId, trackId, filePath, title: path.basename(filePath) });
 
     // Stream the file in 64KB chunks
     const stream = fs.createReadStream(filePath, { highWaterMark: 64 * 1024 });
@@ -322,6 +342,7 @@ function handleRequest(requestId, trackId) {
             ws.send(JSON.stringify({ type: "chunk_end", requestId }));
         }
         activeStreams.delete(requestId);
+        tuiBridge.emit("stream:end", requestId);
     });
 
     stream.on("error", (err) => {
@@ -330,6 +351,7 @@ function handleRequest(requestId, trackId) {
             ws.send(JSON.stringify({ type: "chunk_error", requestId, message: err.message }));
         }
         activeStreams.delete(requestId);
+        tuiBridge.emit("stream:error", { requestId, message: err.message });
     });
 }
 
@@ -339,6 +361,7 @@ function handleCancel(requestId) {
         console.log(`⏹ Canceled stream request: ${requestId}`);
         stream.destroy();
         activeStreams.delete(requestId);
+        tuiBridge.emit("stream:cancel", requestId);
     }
 }
 
@@ -348,6 +371,35 @@ function cleanupStreams() {
     }
     activeStreams.clear();
 }
+
+// Commands from TUI
+tuiBridge.on("cmd:rescan", () => {
+    console.log("🔄 Triggering manual rescan and reconnect...");
+    cleanupStreams();
+    if (ws) {
+        ws.terminate();
+    }
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    connect();
+});
+
+tuiBridge.on("cmd:toggle_downloads", () => {
+    options.allowDownloads = !options.allowDownloads;
+    console.log(`🔒 Downloads permission toggled to: ${options.allowDownloads ? "ALLOWED" : "DISABLED"}`);
+    tuiBridge.emit("config:downloads", options.allowDownloads);
+    cleanupStreams();
+    if (ws) {
+        ws.terminate();
+    }
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+    connect();
+});
 
 // Graceful exit
 process.on("SIGINT", () => {
@@ -360,4 +412,8 @@ process.on("SIGINT", () => {
 });
 
 // Start connection loop
+if (options.tui) {
+    const { initTui } = await import("./peer-tui.js");
+    initTui(tuiBridge, options);
+}
 connect();

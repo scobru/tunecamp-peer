@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node peer-daemon.js",
+    "tui": "node peer-daemon.js --tui",
     "scan": "node peer-daemon.js --scan-only"
   },
   "keywords": [
@@ -17,6 +18,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "blessed": "^0.1.81",
     "music-metadata": "^11.12.3",
     "ws": "^8.21.0"
   }
