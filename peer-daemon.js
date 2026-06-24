@@ -211,9 +211,30 @@ if (options.scanOnly) {
 let reconnectDelay = 2000;
 let ws = null;
 let reconnectTimeout = null;
+let currentAttemptId = 0;
 
 async function connect() {
+    const attemptId = ++currentAttemptId;
+
+    if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+    }
+
+    if (ws) {
+        ws.removeAllListeners();
+        try {
+            ws.terminate();
+        } catch {}
+        ws = null;
+    }
+
     const manifests = await scanFolders(options.folders);
+    
+    if (attemptId !== currentAttemptId) {
+        return;
+    }
+
     console.log(`✓ Scan complete. Sharing ${manifests.length} tracks.`);
 
     // Convert server HTTP url to WebSocket protocol (ws/wss)
@@ -223,15 +244,18 @@ async function connect() {
     console.log(`🔌 Connecting to TuneCamp instance: ${options.server}`);
     tuiBridge.emit("conn:connecting", { server: options.server });
     
-    ws = new WebSocket(wsUrl);
+    const socketInstance = new WebSocket(wsUrl);
+    ws = socketInstance;
 
-    ws.on("open", () => {
+    socketInstance.on("open", () => {
+        if (ws !== socketInstance) return;
         console.log("⚡ Connected! Authenticating...");
         tuiBridge.emit("conn:open");
         reconnectDelay = 2000; // Reset reconnect delay
     });
 
-    ws.on("message", (data) => {
+    socketInstance.on("message", (data) => {
+        if (ws !== socketInstance) return;
         try {
             const message = JSON.parse(data.toString());
             
@@ -239,18 +263,22 @@ async function connect() {
                 case "auth_ok":
                     console.log(`🚀 Authentication successful! Session ID: ${message.sessionId}`);
                     console.log("📤 Sending shared tracks manifest...");
-                    ws.send(JSON.stringify({ type: "manifest", tracks: manifests }));
+                    if (ws === socketInstance && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "manifest", tracks: manifests }));
+                    }
                     tuiBridge.emit("conn:auth_ok", { sessionId: message.sessionId, manifestsCount: manifests.length });
                     break;
 
                 case "auth_fail":
                     console.error(`❌ Authentication failed: ${message.reason}`);
                     tuiBridge.emit("conn:auth_fail", message.reason);
-                    ws.close();
+                    socketInstance.close();
                     process.exit(1);
 
                 case "ping":
-                    ws.send(JSON.stringify({ type: "pong" }));
+                    if (ws === socketInstance && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: "pong" }));
+                    }
                     break;
 
                 case "stream_request":
@@ -270,7 +298,8 @@ async function connect() {
         }
     });
 
-    ws.on("close", () => {
+    socketInstance.on("close", () => {
+        if (ws !== socketInstance) return;
         console.log(`🔌 Connection closed. Reconnecting in ${reconnectDelay / 1000}s...`);
         cleanupStreams();
         tuiBridge.emit("conn:close", { reconnectDelay });
@@ -279,7 +308,8 @@ async function connect() {
         reconnectDelay = Math.min(reconnectDelay * 2, 60000); // Exponential backoff max 60s
     });
 
-    ws.on("error", (err) => {
+    socketInstance.on("error", (err) => {
+        if (ws !== socketInstance) return;
         console.error("❌ WebSocket connection error:", err.message);
         tuiBridge.emit("conn:error", err.message);
     });
@@ -289,11 +319,13 @@ function handleRequest(requestId, trackId) {
     const filePath = trackIdToPath.get(trackId);
     if (!filePath || !fs.existsSync(filePath)) {
         console.warn(`⚠️ Request ${requestId} failed: Track ID ${trackId} file not found locally.`);
-        ws.send(JSON.stringify({
-            type: "chunk_error",
-            requestId,
-            message: "File not found locally"
-        }));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: "chunk_error",
+                requestId,
+                message: "File not found locally"
+            }));
+        }
         tuiBridge.emit("stream:error", { requestId, trackId, message: "File not found locally" });
         return;
     }
@@ -308,7 +340,7 @@ function handleRequest(requestId, trackId) {
     let seq = 0;
 
     stream.on("data", (chunk) => {
-        if (ws.readyState !== WebSocket.OPEN) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
             stream.destroy();
             return;
         }
@@ -317,7 +349,7 @@ function handleRequest(requestId, trackId) {
         if (ws.bufferedAmount > 1024 * 1024) { // 1MB buffer limit
             stream.pause();
             const drainInterval = setInterval(() => {
-                if (ws.readyState !== WebSocket.OPEN) {
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
                     clearInterval(drainInterval);
                     stream.destroy();
                     return;
@@ -329,16 +361,18 @@ function handleRequest(requestId, trackId) {
             }, 50);
         }
 
-        ws.send(JSON.stringify({
-            type: "chunk",
-            requestId,
-            seq: seq++,
-            data: chunk.toString("base64")
-        }));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: "chunk",
+                requestId,
+                seq: seq++,
+                data: chunk.toString("base64")
+            }));
+        }
     });
 
     stream.on("end", () => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "chunk_end", requestId }));
         }
         activeStreams.delete(requestId);
@@ -347,7 +381,7 @@ function handleRequest(requestId, trackId) {
 
     stream.on("error", (err) => {
         console.error(`❌ Stream error for request ${requestId}:`, err.message);
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: "chunk_error", requestId, message: err.message }));
         }
         activeStreams.delete(requestId);
@@ -376,13 +410,6 @@ function cleanupStreams() {
 tuiBridge.on("cmd:rescan", () => {
     console.log("🔄 Triggering manual rescan and reconnect...");
     cleanupStreams();
-    if (ws) {
-        ws.terminate();
-    }
-    if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-    }
     connect();
 });
 
@@ -391,13 +418,6 @@ tuiBridge.on("cmd:toggle_downloads", () => {
     console.log(`🔒 Downloads permission toggled to: ${options.allowDownloads ? "ALLOWED" : "DISABLED"}`);
     tuiBridge.emit("config:downloads", options.allowDownloads);
     cleanupStreams();
-    if (ws) {
-        ws.terminate();
-    }
-    if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
-    }
     connect();
 });
 
@@ -406,7 +426,10 @@ process.on("SIGINT", () => {
     console.log("\n🛑 Stopping peer daemon...");
     cleanupStreams();
     if (ws) {
-        ws.terminate();
+        ws.removeAllListeners();
+        try {
+            ws.terminate();
+        } catch {}
     }
     process.exit(0);
 });
