@@ -83,6 +83,7 @@ export function initTui(tuiBridge, options) {
         },
         scrollable: true,
         alwaysScroll: true,
+        scrollback: 100,
         scrollbar: {
             ch: " ",
             inverse: true
@@ -180,6 +181,7 @@ export function initTui(tuiBridge, options) {
     let currentMode = "sharing"; // "sharing" or "network"
     let activePeers = [];
     let activeTracks = [];
+    let lastStreamsContent = "";
 
     function formatState(state) {
         if (state === "Online") return "{green-fg}{bold}Online (Connected){/bold}{/green-fg}";
@@ -211,8 +213,12 @@ export function initTui(tuiBridge, options) {
 
     function updateStreams() {
         if (currentStreams.size === 0) {
-            streamsBox.setContent("\n   {gray-fg}No active streams or downloads.{/gray-fg}");
-            screen.render();
+            const emptyMsg = "\n   {gray-fg}No active streams or downloads.{/gray-fg}";
+            if (lastStreamsContent !== emptyMsg) {
+                streamsBox.setContent(emptyMsg);
+                screen.render();
+                lastStreamsContent = emptyMsg;
+            }
             return;
         }
 
@@ -222,7 +228,10 @@ export function initTui(tuiBridge, options) {
             lines.push(` 🎵 {bold}${stream.title}{/bold}`);
             lines.push(`    ID: {gray-fg}${reqId.substring(0, 8)}...{/gray-fg} | Elapsed: ${elapsed}s`);
         }
-        streamsBox.setContent(lines.join("\n"));
+        
+        const newContent = lines.join("\n");
+        streamsBox.setContent(newContent);
+        lastStreamsContent = newContent;
         screen.render();
     }
 
